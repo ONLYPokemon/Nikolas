@@ -3,7 +3,7 @@
 Postgame - local server.
 
 Serves the Postgame app at http://localhost:8765 and fetches your ranked games
-from Riot's API using your own development key. Uses only Python's standard
+(Solo/Duo, Flex or both) from Riot's API using your own development key. Uses only Python's standard
 library, so there is nothing to install beyond Python 3.8+.
 
 Run:  python server.py      (Windows)
@@ -29,8 +29,11 @@ KEY_FILE = os.path.join(HERE, "riot_key.txt")
 STATE_FILE = os.path.join(DATA, "state.json")
 PORT = int(os.environ.get("POSTGAME_PORT", "8765"))
 PROCESS_VERSION = "v2"
-RANKED_SOLO = 420
+# Queue choice -> Riot queue ids. Solo/Duo is 420, Flex 5v5 is 440.
+QUEUES = {"solo": (420,), "flex": (440,), "all": (420, 440)}
+QUEUE_TYPE = {420: "RANKED_SOLO_5x5", 440: "RANKED_FLEX_SR"}
 GAMES = 20
+MAX_GAMES = 200
 
 os.makedirs(CACHE, exist_ok=True)
 
@@ -43,7 +46,7 @@ REGION = {
 }
 
 PROGRESS = {"stage": "", "done": 0, "total": 0}
-_ddragon = {"version": None, "at": 0}
+_ddragon = {"version": None, "at": 0, "classes": None, "classes_for": None}
 
 
 def ddragon_version():
@@ -57,6 +60,36 @@ def ddragon_version():
     except (urllib.error.URLError, ValueError, IndexError):
         pass
     return _ddragon["version"]
+
+
+def champion_classes():
+    """Champion id -> class tags (Mage, Assassin, ...) from Data Dragon, cached on disk per game version.
+    The page uses them for class tips on champions it has no hand-written tips for."""
+    ver = ddragon_version()
+    if not ver:
+        return None
+    if _ddragon["classes_for"] == ver:
+        return _ddragon["classes"]
+    path = os.path.join(DATA, f"champions_{ver}.json")
+    classes = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                classes = json.load(f)
+        except (OSError, ValueError):
+            classes = None
+    if classes is None:
+        try:
+            req = urllib.request.Request(f"https://ddragon.leagueoflegends.com/cdn/{ver}/data/en_US/champion.json",
+                                         headers={"User-Agent": "Postgame-local/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                classes = {k: v.get("tags", []) for k, v in json.load(r)["data"].items()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(classes, f)
+        except (urllib.error.URLError, ValueError, KeyError, OSError):
+            return None
+    _ddragon.update(classes=classes, classes_for=ver)
+    return classes
 
 
 # ---------------------------------------------------------------- Riot API
@@ -270,6 +303,7 @@ def process(match, timeline, puuid):
 
     return {
         "id": match["metadata"]["matchId"],
+        "queue": info.get("queueId"),
         "end": end,
         "win": bool(me.get("win")),
         "dur": round(minutes),
@@ -311,30 +345,62 @@ def get_rank(platform, puuid):
             raise
         summ = riot(platform, f"/lol/summoner/v4/summoners/by-puuid/{puuid}")
         entries = riot(platform, f"/lol/league/v4/entries/by-summoner/{summ['id']}")
-    solo = next((x for x in entries if x.get("queueType") == "RANKED_SOLO_5x5"), None)
-    if not solo:
-        return None
-    return {"tier": solo["tier"], "div": solo.get("rank", ""), "lp": solo.get("leaguePoints", 0),
-            "wins": solo.get("wins", 0), "losses": solo.get("losses", 0)}
+    ranks = {}
+    for name, qid in (("solo", 420), ("flex", 440)):
+        e = next((x for x in entries if x.get("queueType") == QUEUE_TYPE[qid]), None)
+        if e:
+            ranks[name] = {"tier": e["tier"], "div": e.get("rank", ""), "lp": e.get("leaguePoints", 0),
+                           "wins": e.get("wins", 0), "losses": e.get("losses", 0)}
+    return ranks
 
 
-def load_player(name, tag, platform):
+def match_number(mid):
+    """Match ids end in a number that grows over time on each platform, e.g. EUW1_7123456789."""
+    try:
+        return int(mid.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def ranked_ids(region, puuid, queues, count):
+    """The newest `count` match ids across the given queues, tagged with their queue.
+    Riot returns at most 100 ids per call, so longer lists are read in pages."""
+    tagged = {}
+    for q in queues:
+        start = 0
+        while start < count:
+            n = min(100, count - start)
+            page = riot(region, f"/lol/match/v5/matches/by-puuid/{puuid}/ids", {"queue": q, "start": start, "count": n})
+            for mid in page:
+                tagged.setdefault(mid, q)
+            if len(page) < n:
+                break
+            start += n
+    ids = sorted(tagged, key=match_number, reverse=True)
+    return [(mid, tagged[mid]) for mid in ids[:count]], len(tagged) >= count
+
+
+def load_player(name, tag, platform, queue="solo", count=GAMES):
     platform = platform.lower()
     region = REGION.get(platform)
     if not region:
         raise RiotError(400, "BAD_REGION")
+    if queue not in QUEUES:
+        queue = "solo"
+    count = max(1, min(MAX_GAMES, count))
     PROGRESS.update(stage="Finding your account", done=0, total=0)
     acct = riot(region, f"/riot/account/v1/accounts/by-riot-id/{urllib.parse.quote(name)}/{urllib.parse.quote(tag)}")
     puuid = acct["puuid"]
     PROGRESS["stage"] = "Reading your rank"
-    rank = get_rank(platform, puuid)
+    ranks = get_rank(platform, puuid)
     PROGRESS["stage"] = "Listing your recent ranked games"
-    ids = riot(region, f"/lol/match/v5/matches/by-puuid/{puuid}/ids", {"queue": RANKED_SOLO, "start": 0, "count": GAMES})
+    ids, more = ranked_ids(region, puuid, QUEUES[queue], count)
     PROGRESS.update(stage="Analysing games", done=0, total=len(ids))
     matches = []
-    for mid in ids:
+    for mid, qid in ids:
         try:
             m = get_match(mid, region, puuid)
+            m.setdefault("queue", qid)  # games cached before Flex support have no queue saved
             if not m["remake"]:
                 matches.append(m)
         except RiotError as e:
@@ -347,20 +413,29 @@ def load_player(name, tag, platform):
     with _state_lock:
         state = load_state()
         p = state["players"].setdefault(puuid, {"lpHistory": [], "focus": None})
-        if rank:
-            snap = {"ts": int(time.time() * 1000), "tier": rank["tier"], "div": rank["div"], "lp": rank["lp"]}
-            last = p["lpHistory"][-1] if p["lpHistory"] else None
-            if not last or (last["tier"], last["div"], last["lp"]) != (snap["tier"], snap["div"], snap["lp"]):
-                p["lpHistory"].append(snap)
-                p["lpHistory"] = p["lpHistory"][-200:]
+        # Solo/Duo history keeps its original key so older state files carry on.
+        for qname, hkey in (("solo", "lpHistory"), ("flex", "lpHistoryFlex")):
+            rank = ranks.get(qname)
+            hist = p.setdefault(hkey, [])
+            if rank:
+                snap = {"ts": int(time.time() * 1000), "tier": rank["tier"], "div": rank["div"], "lp": rank["lp"]}
+                last = hist[-1] if hist else None
+                if not last or (last["tier"], last["div"], last["lp"]) != (snap["tier"], snap["div"], snap["lp"]):
+                    hist.append(snap)
+                    p[hkey] = hist[-200:]
         save_state(state)
+    shown = "flex" if queue == "flex" else "solo"
     PROGRESS.update(stage="Done")
     return {
         "player": {"name": acct.get("gameName", name), "tag": acct.get("tagLine", tag), "platform": platform,
-                   "puuid": puuid, "rank": rank, "role": roles.most_common(1)[0][0] if roles else "MIDDLE"},
+                   "puuid": puuid, "rank": ranks.get(shown), "ranks": ranks,
+                   "role": roles.most_common(1)[0][0] if roles else "MIDDLE"},
+        "queue": queue,
+        "count": count,
+        "more": more and count < MAX_GAMES,
         "matches": matches,
         "focus": p["focus"],
-        "lpHistory": p["lpHistory"],
+        "lpHistory": p["lpHistory"] if shown == "solo" else p.get("lpHistoryFlex", []),
     }
 
 
@@ -404,12 +479,17 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/status":
             return self._send(200, {"hasKey": bool(get_key())})
         if url.path == "/api/assets":
-            return self._send(200, {"version": ddragon_version()})
+            return self._send(200, {"version": ddragon_version(), "classes": champion_classes()})
         if url.path == "/api/progress":
             return self._send(200, PROGRESS)
         if url.path == "/api/load":
             try:
-                return self._send(200, load_player(q.get("name", ""), q.get("tag", ""), q.get("platform", "")))
+                try:
+                    count = int(q.get("count", GAMES))
+                except ValueError:
+                    count = GAMES
+                return self._send(200, load_player(q.get("name", ""), q.get("tag", ""), q.get("platform", ""),
+                                                   q.get("queue", "solo"), count))
             except RiotError as e:
                 PROGRESS["stage"] = ""
                 return self._error(e)
