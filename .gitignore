@@ -1,0 +1,5 @@
+# Personal data written by the app: never commit
+riot_key.txt
+data/
+__pycache__/
+.DS_Store
